@@ -132,30 +132,312 @@ void handle_keypad(void);
 
 // --- NHÓM 3: TÍNH TOÁN VẬT LÝ & VA CHẠM (PHYSICS) ---
 // Nạp thông số bản đồ mới (id = 0, 1, 2) từ bảng MAPS[] và đặt lại vị trí target_y ban đầu
-void map_load(unsigned char id);
+/* Game physics and collision detection.
+ * X points right and Y points up. Time is measured in game ticks.
+ */
+#define PHYSICS_MIN_ANGLE_DEG        15
+#define PHYSICS_MAX_ANGLE_DEG        75
+#define TARGET_MOVE_INTERVAL_TICKS   4
+#define PHYSICS_MAX_FLIGHT_TICKS     750
+#define PHYSICS_SUBSTEPS_PER_TICK    4
+#define PHYSICS_EPSILON              0.0001f
+#define COLLISION_SEPARATION_PX      0.001f
 
-// Cộng/trừ góc nâng nòng pháo theo tham số delta và giới hạn trong [15, 75] độ
-void physics_set_angle(int delta);
+#define COLLISION_NONE               0
+#define COLLISION_HIT                1
+#define COLLISION_MISS               2
+#define COLLISION_BOUNCE             3
 
-// Tính tọa độ xuất phát tại đầu nòng và vận tốc ban đầu (vx, vy) dựa theo góc & lực
-void physics_launch_ball(void);
+static int previous_target_y;
+static unsigned char target_move_ticks = 0;
+static unsigned char flight_result = COLLISION_NONE;
+static unsigned int flight_ticks = 0;
 
-// Cập nhật tọa độ (ball_x, ball_y) theo trọng lực và xử lý nảy khi chạm trần/tường
-void physics_update_ball(void);
+/* Map IDs are 1, 2 and 3. The table index starts at 0. */
+void map_load(unsigned char id)
+{
+    unsigned char i;
 
-// Cập nhật tọa độ di chuyển lên/xuống của bia mục tiêu khi người chơi chọn Map 3
-void physics_update_target(void);
+    if (id < 1 || id > 3) return;
+    i = id - 1;
 
-// Kiểm tra trạng thái quả bóng (0: đang bay, 1: rơi trúng rổ, 2: bắn trượt/chạm đất)
-unsigned char physics_check_collision(void);
+    current_map.has_wall = MAPS[i].has_wall;
+    current_map.wall_x = MAPS[i].wall_x;
+    current_map.wall_y = MAPS[i].wall_y;
+    current_map.wall_w = MAPS[i].wall_w;
+    current_map.wall_h = MAPS[i].wall_h;
+    current_map.basket_x = MAPS[i].basket_x;
+    current_map.basket_w = MAPS[i].basket_w;
+    current_map.basket_h = MAPS[i].basket_h;
+    current_map.basket_min_y = MAPS[i].basket_min_y;
+    current_map.basket_max_y = MAPS[i].basket_max_y;
+    current_map.is_moving = MAPS[i].is_moving;
 
+    map_id = id;
+    target_y = current_map.basket_min_y;
+    target_dir = 1;
+    previous_target_y = target_y;
+    target_move_ticks = 0;
 
-// --- NHÓM 4: HIỂN THỊ ĐỒ HỌA CHIẾN TRƯỜNG TRÊN GLCD (84x48) ---
-// Cấu hình thông số vật lý (font, contrast, bias) và xóa trắng màn hình GLCD
-void glcd_ui_init(void);
+    flight_result = COLLISION_NONE;
+    flight_ticks = 0;
+    ball_x = CANNON_X;
+    ball_y = CANNON_Y;
+    vx = 0.0f;
+    vy = 0.0f;
 
-// Xóa khung cũ và vẽ lại toàn bộ bệ pháo, nòng pháo, tường chắn, rổ và bóng lên GLCD
-void glcd_render_frame(void);
+    lcd_dirty = 1;
+    glcd_dirty = 1;
+}
+
+void physics_set_angle(int delta)
+{
+    long next_angle;
+
+    next_angle = (long)angle + delta;
+    if (next_angle < PHYSICS_MIN_ANGLE_DEG)
+        next_angle = PHYSICS_MIN_ANGLE_DEG;
+    if (next_angle > PHYSICS_MAX_ANGLE_DEG)
+        next_angle = PHYSICS_MAX_ANGLE_DEG;
+
+    if (angle != (int)next_angle) {
+        angle = (int)next_angle;
+        lcd_dirty = 1;
+        glcd_dirty = 1;
+    }
+}
+
+void physics_launch_ball(void)
+{
+    float theta, speed, cosine, sine;
+
+    physics_set_angle(0);
+    if (power_lvl < 1 || power_lvl > 3) {
+        power_lvl = 2;
+        lcd_dirty = 1;
+    }
+
+    theta = angle * (3.14159265358979323846f / 180.0f);
+    cosine = (float)cos(theta);
+    sine = (float)sin(theta);
+    speed = V0_TABLE[power_lvl];
+
+    ball_x = CANNON_X + BARREL_LEN * cosine;
+    ball_y = CANNON_Y + BARREL_LEN * sine;
+    vx = speed * cosine;
+    vy = speed * sine;
+
+    previous_target_y = target_y;
+    flight_result = COLLISION_NONE;
+    flight_ticks = 0;
+    glcd_dirty = 1;
+}
+
+void physics_update_target(void)
+{
+    previous_target_y = target_y;
+
+    if (!current_map.is_moving) return;
+    if (++target_move_ticks < TARGET_MOVE_INTERVAL_TICKS) return;
+
+    target_move_ticks = 0;
+    target_y += target_dir;
+
+    if (target_y >= current_map.basket_max_y) {
+        target_y = current_map.basket_max_y;
+        target_dir = -1;
+    } else if (target_y <= current_map.basket_min_y) {
+        target_y = current_map.basket_min_y;
+        target_dir = 1;
+    }
+
+    glcd_dirty = 1;
+}
+
+/* Select the first contact along the current movement segment. */
+static void consider_collision(
+    float fraction, unsigned char kind,
+    signed char normal_x, signed char normal_y,
+    float *best_fraction, unsigned char *best_kind,
+    signed char *best_x, signed char *best_y)
+{
+    if (fraction < 0.0f || fraction > 1.0f) return;
+
+    if (fraction < *best_fraction - PHYSICS_EPSILON) {
+        *best_fraction = fraction;
+        *best_kind = kind;
+        *best_x = normal_x;
+        *best_y = normal_y;
+    } else if (fabs(fraction - *best_fraction) <= PHYSICS_EPSILON &&
+               kind == COLLISION_BOUNCE && *best_kind == COLLISION_BOUNCE) {
+        if (normal_x != 0) *best_x = normal_x;
+        if (normal_y != 0) *best_y = normal_y;
+    }
+}
+
+static void physics_advance_substep(float duration, float tick_fraction)
+{
+    float remaining, end_x, end_y, dx, dy, fraction, other;
+    float best, consumed, left, right, bottom, top;
+    float rim_start, rim_end, gap_start, gap_end, crossing_x;
+    unsigned char kind, contacts;
+    signed char normal_x, normal_y;
+
+    remaining = duration;
+    contacts = 0;
+
+    while (remaining > PHYSICS_EPSILON && flight_result == COLLISION_NONE) {
+        end_x = ball_x + vx * remaining;
+        end_y = ball_y + vy * remaining
+              - 0.5f * GRAVITY * remaining * remaining;
+        dx = end_x - ball_x;
+        dy = end_y - ball_y;
+
+        best = 2.0f;
+        kind = COLLISION_NONE;
+        normal_x = 0;
+        normal_y = 0;
+
+        /* The sides and ceiling bounce. Ground contact ends the shot. */
+        if (dx < -PHYSICS_EPSILON)
+            consider_collision(-ball_x / dx, COLLISION_BOUNCE, 1, 0,
+                &best, &kind, &normal_x, &normal_y);
+
+        if (dx > PHYSICS_EPSILON)
+            consider_collision((SCREEN_W - 1 - ball_x) / dx,
+                COLLISION_BOUNCE, -1, 0, &best, &kind, &normal_x, &normal_y);
+
+        if (dy > PHYSICS_EPSILON)
+            consider_collision((SCREEN_H - 1 - ball_y) / dy,
+                COLLISION_BOUNCE, 0, -1, &best, &kind, &normal_x, &normal_y);
+
+        if (dy < -PHYSICS_EPSILON)
+            consider_collision(-ball_y / dy, COLLISION_MISS, 0, 0,
+                &best, &kind, &normal_x, &normal_y);
+
+        /* Check the four faces of the wall. */
+        if (current_map.has_wall) {
+            left = current_map.wall_x;
+            right = left + current_map.wall_w;
+            bottom = current_map.wall_y;
+            top = bottom + current_map.wall_h;
+
+            if (dx > PHYSICS_EPSILON) {
+                fraction = (left - ball_x) / dx;
+                other = ball_y + dy * fraction;
+                if (other >= bottom && other <= top)
+                    consider_collision(fraction, COLLISION_BOUNCE, -1, 0,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dx < -PHYSICS_EPSILON) {
+                fraction = (right - ball_x) / dx;
+                other = ball_y + dy * fraction;
+                if (other >= bottom && other <= top)
+                    consider_collision(fraction, COLLISION_BOUNCE, 1, 0,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dy < -PHYSICS_EPSILON) {
+                fraction = (top - ball_y) / dy;
+                other = ball_x + dx * fraction;
+                if (other >= left && other <= right)
+                    consider_collision(fraction, COLLISION_BOUNCE, 0, 1,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dy > PHYSICS_EPSILON) {
+                fraction = (bottom - ball_y) / dy;
+                other = ball_x + dx * fraction;
+                if (other >= left && other <= right)
+                    consider_collision(fraction, COLLISION_BOUNCE, 0, -1,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+        }
+
+        /* Interpolate where the ball crosses the basket opening. */
+        rim_start = previous_target_y + current_map.basket_h
+                  + (target_y - previous_target_y) * tick_fraction;
+        rim_end = previous_target_y + current_map.basket_h
+                + (target_y - previous_target_y) * (tick_fraction + remaining);
+
+        gap_start = ball_y - rim_start;
+        gap_end = end_y - rim_end;
+
+        if (gap_start >= 0.0f && gap_end <= 0.0f && gap_start > gap_end) {
+            fraction = gap_start / (gap_start - gap_end);
+            crossing_x = ball_x + dx * fraction;
+
+            if (vy - GRAVITY * remaining * fraction < 0.0f &&
+                crossing_x > current_map.basket_x &&
+                crossing_x < current_map.basket_x + current_map.basket_w) {
+                consider_collision(fraction, COLLISION_HIT, 0, 0,
+                    &best, &kind, &normal_x, &normal_y);
+            }
+        }
+
+        if (kind == COLLISION_NONE) {
+            ball_x = end_x;
+            ball_y = end_y;
+            vy -= GRAVITY * remaining;
+            return;
+        }
+
+        consumed = remaining * best;
+        ball_x += dx * best;
+        ball_y += dy * best;
+        vy -= GRAVITY * consumed;
+        tick_fraction += consumed;
+        remaining -= consumed;
+
+        if (kind == COLLISION_HIT || kind == COLLISION_MISS) {
+            flight_result = kind;
+            return;
+        }
+
+        if (normal_x != 0) {
+            vx = -vx * BOUNCE_FACTOR;
+            ball_x += normal_x * COLLISION_SEPARATION_PX;
+        }
+        if (normal_y != 0) {
+            vy = -vy * BOUNCE_FACTOR;
+            ball_y += normal_y * COLLISION_SEPARATION_PX;
+        }
+
+        if (++contacts >= 4) {
+            flight_result = COLLISION_MISS;
+            return;
+        }
+    }
+}
+
+void physics_update_ball(void)
+{
+    unsigned char step;
+    float duration;
+
+    if (flight_result != COLLISION_NONE) return;
+
+    duration = 1.0f / PHYSICS_SUBSTEPS_PER_TICK;
+    for (step = 0;
+         step < PHYSICS_SUBSTEPS_PER_TICK && flight_result == COLLISION_NONE;
+         ++step) {
+        physics_advance_substep(duration, step * duration);
+    }
+
+    if (++flight_ticks >= PHYSICS_MAX_FLIGHT_TICKS &&
+        flight_result == COLLISION_NONE) {
+        flight_result = COLLISION_MISS;
+    }
+
+    glcd_dirty = 1;
+}
+
+/* 0 = still flying, 1 = hit, 2 = miss. */
+unsigned char physics_check_collision(void)
+{
+    return flight_result;
+}
 
 
 // --- NHÓM 5: HIỂN THỊ PHỤ & TÍN HIỆU BÁO HIỆU (LCD, LED 7 ĐOẠN, RELAY, RGB) ---
@@ -297,27 +579,99 @@ void rgb_set_state(unsigned char state) {
 
 // 6. HÀM MAIN (VÒNG LẶP CHÍNH)
 // Cần check logic lại nhé. logic bên dưới chỉ là gợi ý.
-void main(void) {
-    // Gọi các hàm init thiết lập trạng thái ban đầu
-    
+void main(void)
+{
+    unsigned char saved_sreg, have_tick;
+    unsigned char result, reset_requested;
+
+    system_init();
+    game_reset();
+    led7_set(score, shots);
+
     while (1) {
-        // --- NHỊP HỆ THỐNG (Mỗi vòng lặp ~8-10ms nhờ quét LED 7 đoạn) ---
-        // 1. Quét LED 7 đoạn & cập nhật bộ đếm tắt Relay (nếu relay_timer > 0) (Chạy trong code ISR)
-        // 2. Gọi input_update() và handle_keypad()
-        
-        // --- MÁY TRẠNG THÁI ---
-        // Case ST_AIM:
-        //   - Cập nhật bia di động (physics_update_target)
-        //   - Nếu Manual: xử lý btn_event (BT2 tăng góc, BT3 giảm góc, BT1 gọi trigger_fire)
-        //   - Nếu Auto: gọi auto_step()
-        
-        // Case ST_FLY:
-        //   - Cập nhật vật lý bóng & bia, vẽ lại GLCD
-        //   - Gọi physics_check_collision():
-        //     + Nếu Trúng (1): score++, last_result = 1, rgb_set_state(1), state_timer = 50 (~1s), chuyển sang ST_RESULT
-        //     + Nếu Trượt (2): last_result = 2, rgb_set_state(2), state_timer = 100 (~2s), chuyển sang ST_RESULT
-        
-        // Case ST_RESULT:
-        //   - Giảm state_timer mỗi tick; khi state_timer == 0 thì bật lại LED xanh dương (rgb_set_state(0)) và quay về ST_AIM
+        /* Wait for the next game tick from Timer0. */
+        saved_sreg = SREG;
+        #asm("cli")
+        have_tick = tick_flag;
+        tick_flag = 0;
+        SREG = saved_sreg;
+
+        if (!have_tick) continue;
+
+        /* Read the controls. Reset is available in every state. */
+        input_update();
+        reset_requested = (key_event == 9);
+        if (reset_requested) btn_event = 0;
+        if (game_state == ST_AIM || reset_requested) handle_keypad();
+        key_event = 0;
+
+        /* Skip the state update on a reset tick. */
+        if (!reset_requested) {
+            switch (game_state) {
+            case ST_AIM:
+                physics_update_target();
+
+                if (auto_mode) {
+                    auto_step();
+                } else {
+                    switch (btn_event) {
+                    case 1: trigger_fire(); break;
+                    case 2: physics_set_angle(1); break;
+                    case 3: physics_set_angle(-1); break;
+                    }
+                }
+
+                if (game_state == ST_FLY) {
+                    lcd_dirty = 1;
+                    glcd_dirty = 1;
+                }
+                break;
+
+            case ST_FLY:
+                physics_update_target();
+                physics_update_ball();
+                result = physics_check_collision();
+
+                if (result != COLLISION_NONE) {
+                    if (result == COLLISION_HIT && score < 99) ++score;
+
+                    last_result = result;
+                    rgb_set_state(result);
+                    state_timer = (result == COLLISION_HIT) ? 50 : 100;
+                    game_state = ST_RESULT;
+                    lcd_dirty = 1;
+                    glcd_dirty = 1;
+                }
+                break;
+
+            case ST_RESULT:
+                if (state_timer == 0) {
+                    game_state = ST_AIM;
+                    last_result = 0;
+                    rgb_set_state(0);
+                    lcd_dirty = 1;
+                    glcd_dirty = 1;
+                }
+                break;
+
+            default:
+                game_reset();
+                break;
+            }
+        }
+
+        /* Refresh displays after handling the game state. */
+        btn_event = 0;
+        led7_set(score, shots);
+
+        if (lcd_dirty) {
+            lcd_update_status();
+            lcd_dirty = 0;
+        }
+
+        if (glcd_dirty) {
+            glcd_render_frame();
+            glcd_dirty = 0;
+        }
     }
 }
