@@ -607,6 +607,13 @@ void main(void)
 
         if (!have_tick) continue;
 
+        if (state_timer != 0) --state_timer;
+
+        if (relay_timer != 0) {
+            --relay_timer;
+            if (relay_timer == 0) RELAY1 = 0;
+        }
+
         /* Read the controls. Reset is available in every state. */
         input_update();
         reset_requested = (key_event == 9);
@@ -673,14 +680,6 @@ void main(void)
         btn_event = 0;
         led7_set(score, shots);
 
-        if (lcd_dirty) {
-            lcd_update_status();
-            lcd_dirty = 0;
-        }
-
-        if (glcd_dirty) {
-            glcd_render_frame();
-            glcd_dirty = 0;
-        }
+        lcd_update_status();
     }
 }
