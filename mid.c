@@ -117,17 +117,161 @@ void auto_step(void);
 
 
 // --- NHÓM 2: GIAO TIẾP ĐẦU VÀO ---
-// Cấu hình nút đơn & ma trận phím
-void input_init(void);
+// NHÓM 2 - GIAO TIẾP ĐẦU VÀO
+// input_update() được gọi một lần mỗi tick, khoảng 20 ms.
+#define INPUT_REPEAT_DELAY 20  // Giữ BT2/BT3 khoảng 400 ms trước khi lặp
+#define INPUT_REPEAT_STEP   5  // Lặp mỗi 100 ms. Đổi thành 3 nếu muốn 60 ms.
 
-// Chạy mỗi tick để quét BT1..3 (có hỗ trợ giữ nút BT2/BT3 để lặp tăng/giảm góc) và ma trận 3x3, lưu vào btn_event & key_event
-void input_update(void);
+typedef struct {
+    unsigned char previous;  // Mẫu đọc ở tick trước
+    unsigned char stable;    // Trạng thái đã qua chống dội
+} InputFilter;
 
-// Quét bàn phím ma trận 3x3 (trả về số 1..9 tương ứng phím bấm, 0 nếu không bấm)
-unsigned char keypad_scan(void);
+static InputFilter button_filter, keypad_filter;
+static unsigned char repeat_ticks;
 
-// Giải mã key_event (1-3: chỉnh power_lvl, 4-6: gọi map_load, 7: đổi Manual/Auto, 9: gọi game_reset)
-void handle_keypad(void);
+// Hai mẫu liên tiếp giống nhau mới xác nhận nhấn hoặc nhả.
+// Trả về mã nút/phím khi vừa nhấn, còn lại trả về 0.
+static unsigned char press_event(InputFilter *filter, unsigned char sample)
+{
+    if (sample == filter->previous && sample != filter->stable) {
+        filter->stable = sample;
+        return sample;
+    }
+
+    filter->previous = sample;
+    return 0;
+}
+
+void input_init(void)
+{
+    // BT1 = PB2, BT2 = PB3, BT3 = PB0. Nhấn đọc được mức 0.
+    DDRB.2 = 0; DDRB.3 = 0; DDRB.0 = 0;
+    PORTB.2 = 1; PORTB.3 = 1; PORTB.0 = 1;
+
+    // Cột ma trận: PC4, PC5, PE0 là đầu vào có điện trở kéo lên.
+    DDRC.4 = 0; DDRC.5 = 0; DDRE.0 = 0;
+    PORTC.4 = 1; PORTC.5 = 1; PORTE.0 = 1;
+
+    // Hàng ma trận: PC6, PE1, PD0.
+    // Khi nghỉ, đặt hàng ở chế độ input và tắt pull-up.
+    // Khi quét, chỉ cần đổi DDR của hàng được chọn sang output để xuất 0.
+    DDRC.6 = 0; DDRE.1 = 0; DDRD.0 = 0;
+    ROW1 = 0; ROW2 = 0; ROW3 = 0;
+
+    button_filter.previous = button_filter.stable = 0;
+    keypad_filter.previous = keypad_filter.stable = 0;
+    btn_event = key_event = repeat_ticks = 0;
+}
+
+// Bố trí ma trận:
+//   Hàng 1: 1 2 3
+//   Hàng 2: 4 5 6
+//   Hàng 3: 7 8 9
+// Trả về 0 nếu không nhấn hoặc phát hiện nhiều phím.
+unsigned char keypad_scan(void)
+{
+    unsigned char row, columns, key = 0;
+
+    for (row = 0; row < 3; ++row) {
+        // Chọn một hàng và kéo hàng đó xuống mức 0.
+        switch (row) {
+        case 0: DDRC.6 = 1; break;
+        case 1: DDRE.1 = 1; break;
+        case 2: DDRD.0 = 1; break;
+        }
+
+        delay_us(10);
+
+        columns = 0;
+        if (!COL1) columns |= 1;
+        if (!COL2) columns |= 2;
+        if (!COL3) columns |= 4;
+
+        // Trả hàng về trạng thái trở kháng cao trước khi quét hàng khác.
+        switch (row) {
+        case 0: DDRC.6 = 0; break;
+        case 1: DDRE.1 = 0; break;
+        case 2: DDRD.0 = 0; break;
+        }
+
+        if (columns == 0) continue;
+
+        // Đã thấy phím ở hàng trước hoặc có nhiều cột cùng được nhấn.
+        if (key || (columns & (columns - 1))) return 0;
+
+        if (columns == 1)      key = row * 3 + 1;
+        else if (columns == 2) key = row * 3 + 2;
+        else                   key = row * 3 + 3;
+    }
+
+    return key;
+}
+
+void input_update(void)
+{
+    unsigned char button = 0;
+
+    // Nếu nhấn nhiều nút đơn, ưu tiên BT1 rồi đến BT2 và BT3.
+    if (!BT1)      button = 1;
+    else if (!BT2) button = 2;
+    else if (!BT3) button = 3;
+
+    btn_event = press_event(&button_filter, button);
+
+    if (btn_event == 2 || btn_event == 3) {
+        // BT2/BT3 vừa được nhấn: phát sự kiện ngay sau chống dội.
+        repeat_ticks = INPUT_REPEAT_DELAY;
+    } else if (button == button_filter.stable &&
+               (button == 2 || button == 3)) {
+        // BT2/BT3 đang được giữ: phát lại khi bộ đếm về 0.
+        if (--repeat_ticks == 0) {
+            btn_event = button;
+            repeat_ticks = INPUT_REPEAT_STEP;
+        }
+    }
+
+    // Phím ma trận chỉ phát sự kiện khi vừa nhấn.
+    key_event = press_event(&keypad_filter, keypad_scan());
+}
+
+// map_load() do nhóm 3 định nghĩa phía dưới, cần khai báo trước để gọi được
+void map_load(unsigned char id);
+
+void handle_keypad(void)
+{
+    unsigned char key = key_event;
+    key_event = 0;
+
+    // Phím 9 cho phép reset ở mọi trạng thái.
+    if (key == 9) {
+        game_reset();
+        return;
+    }
+
+    // Chỉ đổi lực, bản đồ hoặc chế độ khi đang ngắm.
+    if (game_state != ST_AIM) return;
+
+    switch (key) {
+    case 1: case 2: case 3:
+        power_lvl = key;
+        break;
+
+    case 4: case 5: case 6:
+        map_load(key - 3);  // Phím 4/5/6 tương ứng bản đồ 1/2/3
+        break;
+
+    case 7:
+        auto_mode = !auto_mode;
+        state_timer = 0;
+        break;
+
+    default:
+        return;  // Phím 8 hoặc không có sự kiện
+    }
+
+    lcd_dirty = glcd_dirty = 1;
+}
 
 
 // --- NHÓM 3: TÍNH TOÁN VẬT LÝ & VA CHẠM (PHYSICS) ---
