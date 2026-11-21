@@ -98,6 +98,8 @@ flash MapConfig MAPS[3] = {
     {0,  0, 0, 0,  0, 70, 11, 4,  6, 36, 1}  // Map 3: Bia di động chạy từ y = 6 đến y = 36
 };
 
+MapConfig current_map;
+
 volatile unsigned char digit[4];   // digit[0..1] = điểm (chục, đơn vị), digit[2..3] = số phát
 
 // 4. HÀM & MỤC ĐÍCH CHI TIẾT (FUNCTION PROTOTYPES)
@@ -438,6 +440,13 @@ unsigned char physics_check_collision(void)
 {
     return flight_result;
 }
+
+// --- NHÓM 4: HIỂN THỊ ĐỒ HỌA CHIẾN TRƯỜNG TRÊN GLCD (84x48) ---
+// Cấu hình thông số vật lý (font, contrast, bias) và xóa trắng màn hình GLCD
+void glcd_ui_init(void);
+
+// Xóa khung cũ và vẽ lại toàn bộ bệ pháo, nòng pháo, tường chắn, rổ và bóng lên GLCD
+void glcd_render_frame(void);
 
 
 // --- NHÓM 5: HIỂN THỊ PHỤ & TÍN HIỆU BÁO HIỆU (LCD, LED 7 ĐOẠN, RELAY, RGB) ---
