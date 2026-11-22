@@ -104,18 +104,140 @@ volatile unsigned char digit[4];   // digit[0..1] = điểm (chục, đơn vị)
 
 // 4. HÀM & MỤC ĐÍCH CHI TIẾT (FUNCTION PROTOTYPES)
 
-// --- NHÓM 1: KHỞI TẠO & ĐIỀU PHỐI HỆ THỐNG ---
-// Khởi tạo (Input, GLCD, LCD, LED, Relay, ...)
-void system_init(void);
+// --- NHÓM 1: KHỞI TẠO & ĐIỀU PHỐI HỆ THỐNG (NV2) ---
+// Khai báo trước (forward declarations) các hàm thuộc Nhóm 2, 3, 4, 5 mà Nhóm 1 gọi
+void input_init(void);
+void map_load(unsigned char id);
+void physics_set_angle(int delta);
+void physics_launch_ball(void);
+void glcd_ui_init(void);
+void glcd_render_frame(void);
+void feedback_init(void);
+void lcd_update_status(void);
+void led7_set(unsigned char sc, unsigned char sh);
+void timer0_ovf_init(void);
+void rgb_set_state(unsigned char state);
+
+// Hằng số và biến nội bộ cho điều phối hệ thống & chế độ Auto (nhịp 20ms/tick)
+#define RELAY_PULSE_TICKS 5   // Giữ Relay đóng 5 tick (~100ms) tạo tiếng "tạch"
+#define AUTO_SCAN_TICKS   5   // Mỗi 5 tick (~100ms) thay đổi góc nâng 1 bước
+#define AUTO_ANGLE_STEP   3   // Bước quét góc ở chế độ Auto (3 độ/bước)
+#define AUTO_FIRE_TICKS   35  // Mỗi 35 tick (~700ms) tự động khai hỏa 1 phát
+
+static unsigned char auto_scan_cnt = 0;
+static unsigned char auto_fire_cnt = 0;
+
+// Khởi tạo (Input, GLCD, LCD, LED, Relay, đèn nền, Timer0...)
+void system_init(void) {
+    // Bật đèn nền màn hình LCD/GLCD
+    DDRD.7 = 1;
+    LCD_BL = 1;
+
+    // Khởi tạo các khối ngoại vi trước khi bật ngắt Timer0
+    input_init();
+    feedback_init();
+    led7_set(0, 0);
+    glcd_ui_init();
+
+    // Khởi tạo Timer0 (quét LED 7 đoạn 2ms, tạo nhịp hệ thống 20ms và bật ngắt toàn cục)
+    timer0_ovf_init();
+}
 
 // Reset điểm số, số lượt bắn, góc bắn và màn hình về ban đầu
-void game_reset(void);
+void game_reset(void) {
+    // Xóa sự kiện đầu vào & các bộ đếm
+    btn_event = 0;
+    key_event = 0;
+    state_timer = 0;
+    relay_timer = 0;
+    RELAY1 = 0;
+    auto_scan_cnt = 0;
+    auto_fire_cnt = 0;
+
+    // Đặt lại trạng thái trò chơi & thông số bắn mặc định
+    game_state = ST_AIM;
+    auto_mode = 0;
+    map_id = 1;
+    last_result = 0;
+    angle = 45;
+    auto_angle_dir = 1;
+    power_lvl = 2;
+    score = 0;
+    shots = 0;
+
+    // Đặt lại trạng thái vật lý bóng về vị trí bệ pháo
+    ball_x = (float)CANNON_X;
+    ball_y = (float)CANNON_Y;
+    vx = 0.0f;
+    vy = 0.0f;
+
+    // Nạp lại Map 1 (id = 0 trong MAPS[0..2]) và cập nhật toàn bộ hiển thị
+    map_load(0);
+    led7_set(score, shots);
+    rgb_set_state(0);
+
+    lcd_dirty = 1;
+    glcd_dirty = 1;
+    lcd_update_status();
+    glcd_render_frame();
+}
 
 // Thực hiện chuỗi hành động khi khai hỏa (tăng lượt bắn, kích Relay, phóng bóng)
-void trigger_fire(void);
+void trigger_fire(void) {
+    if (game_state != ST_AIM) return;
+
+    // Tăng số phát đã bắn (giới hạn 99 cho 2 LED 7 đoạn phải)
+    if (shots < 99) {
+        shots++;
+    }
+    led7_set(score, shots);
+
+    // Kích Relay tạo tiếng "tạch" (tự ngắt khi relay_timer đếm về 0)
+    RELAY1 = 1;
+    relay_timer = RELAY_PULSE_TICKS;
+
+    // Tính tọa độ xuất phát, vận tốc ban đầu và phóng bóng
+    physics_launch_ball();
+
+    // Chuyển máy trạng thái sang đang bay và đánh dấu cập nhật hiển thị
+    last_result = 0;
+    game_state = ST_FLY;
+    auto_scan_cnt = 0;
+    auto_fire_cnt = 0;
+    lcd_dirty = 1;
+    glcd_dirty = 1;
+}
 
 // Xử lý nhịp hoạt động của chế độ Auto (đếm tick để quét góc lên/xuống, đủ nhịp thì gọi trigger_fire)
-void auto_step(void);
+void auto_step(void) {
+    if (game_state != ST_AIM) return;
+
+    // 1. Quét góc nâng nòng pháo lên/xuống định kỳ trong khoảng [15, 75] độ
+    if (++auto_scan_cnt >= AUTO_SCAN_TICKS) {
+        auto_scan_cnt = 0;
+
+        if (auto_angle_dir == 1) {
+            physics_set_angle(AUTO_ANGLE_STEP);
+            if (angle >= 75) {
+                auto_angle_dir = (char)-1;
+            }
+        } else {
+            physics_set_angle(-AUTO_ANGLE_STEP);
+            if (angle <= 15) {
+                auto_angle_dir = 1;
+            }
+        }
+
+        lcd_dirty = 1;
+        glcd_dirty = 1;
+    }
+
+    // 2. Đủ nhịp chờ thì tự động khai hỏa
+    if (++auto_fire_cnt >= AUTO_FIRE_TICKS) {
+        auto_fire_cnt = 0;
+        trigger_fire();
+    }
+}
 
 
 // --- NHÓM 2: GIAO TIẾP ĐẦU VÀO ---
