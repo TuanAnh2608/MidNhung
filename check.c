@@ -53,15 +53,15 @@ unsigned char last_result  = 0;
 volatile unsigned char state_timer = 0;
 volatile unsigned char relay_timer = 0;
 
-int angle           = 45;
-char auto_angle_dir = 1;
-unsigned char power_lvl = 2;
-unsigned char score     = 0;
-unsigned char shots     = 0;
+int angle                  = 45;
+signed char auto_angle_dir = 1;
+unsigned char power_lvl    = 2;
+unsigned char score        = 0;
+unsigned char shots        = 0;
 
 float ball_x, ball_y;
 float vx, vy;
-int target_y    = 10;
+int target_y           = 10;
 signed char target_dir = 1;
 
 flash float V0_TABLE[4] = {0.0f, 2.4f, 3.2f, 4.1f};
@@ -81,9 +81,9 @@ typedef struct {
 } MapConfig;
 
 flash MapConfig MAPS[3] = {
-    {0,  0, 0, 0,  0, 70, 11, 4, 10, 10, 0}, // Map 1
-    {1, 41, 0, 3, 24, 70, 11, 4, 10, 10, 0}, // Map 2
-    {0,  0, 0, 0,  0, 70, 11, 4,  6, 36, 1}  // Map 3
+    {0,  0, 0, 0,  0, 70, 11, 6, 10, 10, 0}, // Map 1: Khung chu nhat huong len co dinh
+    {1, 41, 0, 3, 24, 70, 11, 6, 10, 10, 0}, // Map 2: Tuong chan + khung chu nhat huong len
+    {0,  0, 0, 0,  0, 70, 11, 4,  6, 36, 1}  // Map 3: Vong tron rong ruot di chuyen
 };
 
 MapConfig current_map;
@@ -201,7 +201,7 @@ void auto_step(void) {
         if (auto_angle_dir == 1) {
             physics_set_angle(AUTO_ANGLE_STEP);
             if (angle >= 75) {
-                auto_angle_dir = (char)-1;
+                auto_angle_dir = -1;
             }
         } else {
             physics_set_angle(-AUTO_ANGLE_STEP);
@@ -508,6 +508,7 @@ static void consider_collision(
 static void physics_advance_substep(float duration, float tick_fraction) {
     float remaining, end_x, end_y, dx, dy, fraction, other;
     float best, consumed, left, right, bottom, top;
+    float box_left, box_right, box_bottom, box_top;
     float target_cx, target_cy, hit_r, dist_x, dist_y;
     unsigned char kind, contacts;
     signed char normal_x, normal_y;
@@ -581,18 +582,35 @@ static void physics_advance_substep(float duration, float tick_fraction) {
             }
         }
 
-        target_cx = current_map.basket_x + (current_map.basket_w * 0.5f);
-        target_cy = (long)previous_target_y + (current_map.basket_h * 0.5f)
-                  + ((long)target_y - previous_target_y) * (tick_fraction + remaining);
-        hit_r  = (current_map.basket_w * 0.5f) + 1.5f;
-        dist_x = end_x - target_cx;
-        dist_y = end_y - target_cy;
+        if (!current_map.is_moving) {
+            // Map 1 & Map 2: Bong phai lot han vao ben trong long khung chu nhat
+            box_left   = (float)current_map.basket_x + 2.0f;
+            box_right  = (float)((long)current_map.basket_x + current_map.basket_w - 1) - 2.0f;
+            box_bottom = (float)target_y + 1.5f;
+            box_top    = (float)((long)target_y + current_map.basket_h) - 1.5f;
 
-        if ((dist_x * dist_x + dist_y * dist_y) <= (hit_r * hit_r)) {
-            ball_x = end_x;
-            ball_y = end_y;
-            flight_result = COLLISION_HIT;
-            return;
+            if (end_x >= box_left && end_x <= box_right &&
+                end_y >= box_bottom && end_y <= box_top) {
+                ball_x = end_x;
+                ball_y = end_y;
+                flight_result = COLLISION_HIT;
+                return;
+            }
+        } else {
+            // Map 3: Bong phai nam ben trong long vong tron rong ruot (khong tinh cham vien ngoai)
+            target_cx = current_map.basket_x + (current_map.basket_w * 0.5f);
+            target_cy = (long)previous_target_y + (current_map.basket_h * 0.5f)
+                      + ((long)target_y - previous_target_y) * (tick_fraction + remaining);
+            hit_r  = (float)(current_map.basket_w / 2) - 1.5f;
+            dist_x = end_x - target_cx;
+            dist_y = end_y - target_cy;
+
+            if ((dist_x * dist_x + dist_y * dist_y) <= (hit_r * hit_r)) {
+                ball_x = end_x;
+                ball_y = end_y;
+                flight_result = COLLISION_HIT;
+                return;
+            }
         }
 
         if (kind == COLLISION_NONE) {
@@ -836,22 +854,34 @@ static void glcd_draw_wall(unsigned char idx) {
 }
 
 static void glcd_draw_target(unsigned char idx) {
+    int bx0, bx1, by_top, by_bot;
     int cx, cy, r;
 
-    r = MAPS[idx].basket_w / 2;
-    if (r < 2) r = 2;
+    if (!MAPS[idx].is_moving) {
+        // Map 1 & Map 2: 1 khung chu nhat ho mieng huong len (hinh chu U)
+        bx0    = clamp_glcd_x(MAPS[idx].basket_x);
+        bx1    = clamp_glcd_x(MAPS[idx].basket_x + MAPS[idx].basket_w - 1);
+        by_bot = phys_to_glcd_y(target_y);
+        by_top = phys_to_glcd_y(target_y + MAPS[idx].basket_h);
 
-    cx = clamp_glcd_x(MAPS[idx].basket_x + r);
-    cy = phys_to_glcd_y(target_y + (MAPS[idx].basket_h / 2));
+        fb_line(bx0, by_top, bx0, by_bot); // Thanh ben trai
+        fb_line(bx0, by_bot, bx1, by_bot); // Day khung chu nhat
+        fb_line(bx1, by_top, bx1, by_bot); // Thanh ben phai
+    } else {
+        // Map 3: Vong tron rong ruot di chuyen len xuong
+        r = MAPS[idx].basket_w / 2;
+        if (r < 2) r = 2;
 
-    if (cx < r) cx = r;
-    if (cx >= SCREEN_W - r) cx = SCREEN_W - 1 - r;
-    if (cy < r) cy = r;
-    if (cy >= SCREEN_H - r) cy = SCREEN_H - 1 - r;
+        cx = clamp_glcd_x(MAPS[idx].basket_x + r);
+        cy = phys_to_glcd_y(target_y + (MAPS[idx].basket_h / 2));
 
-    fb_circle(cx, cy, r);
-    if (r >= 4) fb_circle(cx, cy, r / 2);
-    fb_setpixel(cx, cy);
+        if (cx < r) cx = r;
+        if (cx >= SCREEN_W - r) cx = SCREEN_W - 1 - r;
+        if (cy < r) cy = r;
+        if (cy >= SCREEN_H - r) cy = SCREEN_H - 1 - r;
+
+        fb_circle(cx, cy, r);
+    }
 }
 
 static void glcd_draw_ball(void) {
@@ -906,6 +936,7 @@ void feedback_init(void) {
 
     DDRD.3 = 1; DDRA.7 = 1; DDRD.1 = 1; DDRD.2 = 1;
     PORTD.3 = 1; PORTA.7 = 1; PORTD.1 = 1; PORTD.2 = 1;
+    DDRD.0 = 1; PORTD.0 = 1;
 
     DDRD.4 = 1; DDRD.5 = 1; DDRD.6 = 1;
     PORTD.4 = 0; PORTD.5 = 0; PORTD.6 = 0;
@@ -940,9 +971,11 @@ void lcd_update_status(void) {
 
 flash unsigned char seg7[10] = {0xFC, 0x60, 0xDA, 0xF2, 0x66, 0xB6, 0xBE, 0xE0, 0xFE, 0xF6};
 
-// Quet LED 7 doan (Thanh B dung PD0 thay cho PF5 khi mo phong)
+// Quet LED 7 doan: 2 den trai = Diem | 2 den phai = So luot ban
 void led7_scan_once(unsigned char pos) {
     unsigned char s, pf;
+
+    PORTF = 0x00; // Tat digit cu truoc khi doi thanh LED de tranh lem net
 
     s  = seg7[digit[pos]];
     pf = 0x00;
@@ -976,13 +1009,13 @@ void led7_set(unsigned char sc, unsigned char sh) {
 }
 
 // ============================================================================
-// NGAT TIMER0
+// NGAT TIMER0 (4ms QUET 1 LED 7 DOAN, 20ms TAO NHIP GAME)
 // ============================================================================
 volatile unsigned char tick_flag = 0;
 
 void timer0_ovf_init(void) {
     TCCR0 = (1 << CS02) | (1 << CS01) | (1 << CS00);
-    TCNT0 = 0xF0;
+    TCNT0 = 0xE0;
     TIMSK |= (1 << TOIE0);
     #asm("sei")
 }
@@ -991,12 +1024,12 @@ interrupt [TIM0_OVF] void timer0_ovf_isr(void) {
     static unsigned char digit_idx = 0;
     static unsigned char sub_tick  = 0;
 
-    TCNT0 = 0xF0;
+    TCNT0 = 0xE0;
 
     led7_scan_once(digit_idx);
     digit_idx = (digit_idx + 1) & 3;
 
-    if (++sub_tick >= 10) {
+    if (++sub_tick >= 5) {
         sub_tick  = 0;
         tick_flag = 1;
     }
@@ -1071,7 +1104,10 @@ void main(void) {
                     result = physics_check_collision();
 
                     if (result != COLLISION_NONE) {
-                        if (result == COLLISION_HIT && score < 99) ++score;
+                        if (result == COLLISION_HIT) {
+                            if (score + map_id <= 99) score += map_id;
+                            else score = 99;
+                        }
 
                         last_result = result;
                         rgb_set_state(result);
