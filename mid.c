@@ -43,6 +43,8 @@
 #define BARREL_LEN    12    // Chiều dài nòng pháo (pixel)
 #define GRAVITY 0.05f // Gia tốc trọng trường giả lập
 #define BOUNCE_FACTOR 0.75f // Hệ số bảo toàn vận tốc khi bóng nảy tường
+#define DEG_TO_RAD    0.01745329f   
+#define BALL_RADIUS   2
 
 // 3. BIẾN TOÀN CỤC & MẢNG DỮ LIỆU DÙNG CHUNG
 // Sự kiện đầu vào (cập nhật mỗi tick bởi input_update)
@@ -98,57 +100,614 @@ flash MapConfig MAPS[3] = {
     {0,  0, 0, 0,  0, 70, 11, 4,  6, 36, 1}  // Map 3: Bia di động chạy từ y = 6 đến y = 36
 };
 
+MapConfig current_map;
+
 volatile unsigned char digit[4];   // digit[0..1] = điểm (chục, đơn vị), digit[2..3] = số phát
 
 // 4. HÀM & MỤC ĐÍCH CHI TIẾT (FUNCTION PROTOTYPES)
 
-// --- NHÓM 1: KHỞI TẠO & ĐIỀU PHỐI HỆ THỐNG ---
-// Khởi tạo (Input, GLCD, LCD, LED, Relay, ...)
-void system_init(void);
+// --- NHÓM 1: KHỞI TẠO & ĐIỀU PHỐI HỆ THỐNG (NV2) ---
+// Khai báo trước (forward declarations) các hàm thuộc Nhóm 2, 3, 4, 5 mà Nhóm 1 gọi
+void input_init(void);
+void map_load(unsigned char id);
+void physics_set_angle(int delta);
+void physics_launch_ball(void);
+void glcd_ui_init(void);
+void glcd_render_frame(void);
+void feedback_init(void);
+void lcd_update_status(void);
+void led7_set(unsigned char sc, unsigned char sh);
+void timer0_ovf_init(void);
+void rgb_set_state(unsigned char state);
+
+// Hằng số và biến nội bộ cho điều phối hệ thống & chế độ Auto (nhịp 20ms/tick)
+#define RELAY_PULSE_TICKS 5   // Giữ Relay đóng 5 tick (~100ms) tạo tiếng "tạch"
+#define AUTO_SCAN_TICKS   5   // Mỗi 5 tick (~100ms) thay đổi góc nâng 1 bước
+#define AUTO_ANGLE_STEP   3   // Bước quét góc ở chế độ Auto (3 độ/bước)
+#define AUTO_FIRE_TICKS   35  // Mỗi 35 tick (~700ms) tự động khai hỏa 1 phát
+
+static unsigned char auto_scan_cnt = 0;
+static unsigned char auto_fire_cnt = 0;
+
+// Khởi tạo (Input, GLCD, LCD, LED, Relay, đèn nền, Timer0...)
+void system_init(void) {
+    // Bật đèn nền màn hình LCD/GLCD
+    DDRD.7 = 1;
+    LCD_BL = 1;
+
+    // Khởi tạo các khối ngoại vi trước khi bật ngắt Timer0
+    input_init();
+    feedback_init();
+    led7_set(0, 0);
+    glcd_ui_init();
+
+    // Khởi tạo Timer0 (quét LED 7 đoạn 2ms, tạo nhịp hệ thống 20ms và bật ngắt toàn cục)
+    timer0_ovf_init();
+}
 
 // Reset điểm số, số lượt bắn, góc bắn và màn hình về ban đầu
-void game_reset(void);
+void game_reset(void) {
+    // Xóa sự kiện đầu vào & các bộ đếm
+    btn_event = 0;
+    key_event = 0;
+    state_timer = 0;
+    relay_timer = 0;
+    RELAY1 = 0;
+    auto_scan_cnt = 0;
+    auto_fire_cnt = 0;
+
+    // Đặt lại trạng thái trò chơi & thông số bắn mặc định
+    game_state = ST_AIM;
+    auto_mode = 0;
+    map_id = 1;
+    last_result = 0;
+    angle = 45;
+    auto_angle_dir = 1;
+    power_lvl = 2;
+    score = 0;
+    shots = 0;
+
+    // Đặt lại trạng thái vật lý bóng về vị trí bệ pháo
+    ball_x = (float)CANNON_X;
+    ball_y = (float)CANNON_Y;
+    vx = 0.0f;
+    vy = 0.0f;
+
+    // Nạp lại Map 1 (id = 0 trong MAPS[0..2]) và cập nhật toàn bộ hiển thị
+    map_load(0);
+    led7_set(score, shots);
+    rgb_set_state(0);
+
+    lcd_dirty = 1;
+    glcd_dirty = 1;
+    lcd_update_status();
+    glcd_render_frame();
+}
 
 // Thực hiện chuỗi hành động khi khai hỏa (tăng lượt bắn, kích Relay, phóng bóng)
-void trigger_fire(void);
+void trigger_fire(void) {
+    if (game_state != ST_AIM) return;
+
+    // Tăng số phát đã bắn (giới hạn 99 cho 2 LED 7 đoạn phải)
+    if (shots < 99) {
+        shots++;
+    }
+    led7_set(score, shots);
+
+    // Kích Relay tạo tiếng "tạch" (tự ngắt khi relay_timer đếm về 0)
+    RELAY1 = 1;
+    relay_timer = RELAY_PULSE_TICKS;
+
+    // Tính tọa độ xuất phát, vận tốc ban đầu và phóng bóng
+    physics_launch_ball();
+
+    // Chuyển máy trạng thái sang đang bay và đánh dấu cập nhật hiển thị
+    last_result = 0;
+    game_state = ST_FLY;
+    auto_scan_cnt = 0;
+    auto_fire_cnt = 0;
+    lcd_dirty = 1;
+    glcd_dirty = 1;
+}
 
 // Xử lý nhịp hoạt động của chế độ Auto (đếm tick để quét góc lên/xuống, đủ nhịp thì gọi trigger_fire)
-void auto_step(void);
+void auto_step(void) {
+    if (game_state != ST_AIM) return;
+
+    // 1. Quét góc nâng nòng pháo lên/xuống định kỳ trong khoảng [15, 75] độ
+    if (++auto_scan_cnt >= AUTO_SCAN_TICKS) {
+        auto_scan_cnt = 0;
+
+        if (auto_angle_dir == 1) {
+            physics_set_angle(AUTO_ANGLE_STEP);
+            if (angle >= 75) {
+                auto_angle_dir = (char)-1;
+            }
+        } else {
+            physics_set_angle(-AUTO_ANGLE_STEP);
+            if (angle <= 15) {
+                auto_angle_dir = 1;
+            }
+        }
+
+        lcd_dirty = 1;
+        glcd_dirty = 1;
+    }
+
+    // 2. Đủ nhịp chờ thì tự động khai hỏa
+    if (++auto_fire_cnt >= AUTO_FIRE_TICKS) {
+        auto_fire_cnt = 0;
+        trigger_fire();
+    }
+}
 
 
 // --- NHÓM 2: GIAO TIẾP ĐẦU VÀO ---
-// Cấu hình nút đơn & ma trận phím
-void input_init(void);
+// NHÓM 2 - GIAO TIẾP ĐẦU VÀO
+// input_update() được gọi một lần mỗi tick, khoảng 20 ms.
+#define INPUT_REPEAT_DELAY 20  // Giữ BT2/BT3 khoảng 400 ms trước khi lặp
+#define INPUT_REPEAT_STEP   5  // Lặp mỗi 100 ms. Đổi thành 3 nếu muốn 60 ms.
 
-// Chạy mỗi tick để quét BT1..3 (có hỗ trợ giữ nút BT2/BT3 để lặp tăng/giảm góc) và ma trận 3x3, lưu vào btn_event & key_event
-void input_update(void);
+typedef struct {
+    unsigned char previous;  // Mẫu đọc ở tick trước
+    unsigned char stable;    // Trạng thái đã qua chống dội
+} InputFilter;
 
-// Quét bàn phím ma trận 3x3 (trả về số 1..9 tương ứng phím bấm, 0 nếu không bấm)
-unsigned char keypad_scan(void);
+static InputFilter button_filter, keypad_filter;
+static unsigned char repeat_ticks;
 
-// Giải mã key_event (1-3: chỉnh power_lvl, 4-6: gọi map_load, 7: đổi Manual/Auto, 9: gọi game_reset)
-void handle_keypad(void);
+// Hai mẫu liên tiếp giống nhau mới xác nhận nhấn hoặc nhả.
+// Trả về mã nút/phím khi vừa nhấn, còn lại trả về 0.
+static unsigned char press_event(InputFilter *filter, unsigned char sample)
+{
+    if (sample == filter->previous && sample != filter->stable) {
+        filter->stable = sample;
+        return sample;
+    }
+
+    filter->previous = sample;
+    return 0;
+}
+
+void input_init(void)
+{
+    // BT1 = PB2, BT2 = PB3, BT3 = PB0. Nhấn đọc được mức 0.
+    DDRB.2 = 0; DDRB.3 = 0; DDRB.0 = 0;
+    PORTB.2 = 1; PORTB.3 = 1; PORTB.0 = 1;
+
+    // Cột ma trận: PC4, PC5, PE0 là đầu vào có điện trở kéo lên.
+    DDRC.4 = 0; DDRC.5 = 0; DDRE.0 = 0;
+    PORTC.4 = 1; PORTC.5 = 1; PORTE.0 = 1;
+
+    // Hàng ma trận: PC6, PE1, PD0.
+    // Khi nghỉ, đặt hàng ở chế độ input và tắt pull-up.
+    // Khi quét, chỉ cần đổi DDR của hàng được chọn sang output để xuất 0.
+    DDRC.6 = 0; DDRE.1 = 0; DDRD.0 = 0;
+    ROW1 = 0; ROW2 = 0; ROW3 = 0;
+
+    button_filter.previous = button_filter.stable = 0;
+    keypad_filter.previous = keypad_filter.stable = 0;
+    btn_event = key_event = repeat_ticks = 0;
+}
+
+// Bố trí ma trận:
+//   Hàng 1: 1 2 3
+//   Hàng 2: 4 5 6
+//   Hàng 3: 7 8 9
+// Trả về 0 nếu không nhấn hoặc phát hiện nhiều phím.
+unsigned char keypad_scan(void)
+{
+    unsigned char row, columns, key = 0;
+
+    for (row = 0; row < 3; ++row) {
+        // Chọn một hàng và kéo hàng đó xuống mức 0.
+        switch (row) {
+        case 0: DDRC.6 = 1; break;
+        case 1: DDRE.1 = 1; break;
+        case 2: DDRD.0 = 1; break;
+        }
+
+        delay_us(10);
+
+        columns = 0;
+        if (!COL1) columns |= 1;
+        if (!COL2) columns |= 2;
+        if (!COL3) columns |= 4;
+
+        // Trả hàng về trạng thái trở kháng cao trước khi quét hàng khác.
+        switch (row) {
+        case 0: DDRC.6 = 0; break;
+        case 1: DDRE.1 = 0; break;
+        case 2: DDRD.0 = 0; break;
+        }
+
+        if (columns == 0) continue;
+
+        // Đã thấy phím ở hàng trước hoặc có nhiều cột cùng được nhấn.
+        if (key || (columns & (columns - 1))) return 0;
+
+        if (columns == 1)      key = row * 3 + 1;
+        else if (columns == 2) key = row * 3 + 2;
+        else                   key = row * 3 + 3;
+    }
+
+    return key;
+}
+
+void input_update(void)
+{
+    unsigned char button = 0;
+
+    // Nếu nhấn nhiều nút đơn, ưu tiên BT1 rồi đến BT2 và BT3.
+    if (!BT1)      button = 1;
+    else if (!BT2) button = 2;
+    else if (!BT3) button = 3;
+
+    btn_event = press_event(&button_filter, button);
+
+    if (btn_event == 2 || btn_event == 3) {
+        // BT2/BT3 vừa được nhấn: phát sự kiện ngay sau chống dội.
+        repeat_ticks = INPUT_REPEAT_DELAY;
+    } else if (button == button_filter.stable &&
+               (button == 2 || button == 3)) {
+        // BT2/BT3 đang được giữ: phát lại khi bộ đếm về 0.
+        if (--repeat_ticks == 0) {
+            btn_event = button;
+            repeat_ticks = INPUT_REPEAT_STEP;
+        }
+    }
+
+    // Phím ma trận chỉ phát sự kiện khi vừa nhấn.
+    key_event = press_event(&keypad_filter, keypad_scan());
+}
+
+// map_load() do nhóm 3 định nghĩa phía dưới, cần khai báo trước để gọi được
+void map_load(unsigned char id);
+
+void handle_keypad(void)
+{
+    unsigned char key = key_event;
+    key_event = 0;
+
+    // Phím 9 cho phép reset ở mọi trạng thái.
+    if (key == 9) {
+        game_reset();
+        return;
+    }
+
+    // Chỉ đổi lực, bản đồ hoặc chế độ khi đang ngắm.
+    if (game_state != ST_AIM) return;
+
+    switch (key) {
+    case 1: case 2: case 3:
+        power_lvl = key;
+        break;
+
+    case 4: case 5: case 6:
+        map_load(key - 3);  // Phím 4/5/6 tương ứng bản đồ 1/2/3
+        break;
+
+    case 7:
+        auto_mode = !auto_mode;
+        state_timer = 0;
+        break;
+
+    default:
+        return;  // Phím 8 hoặc không có sự kiện
+    }
+
+    lcd_dirty = glcd_dirty = 1;
+}
 
 
 // --- NHÓM 3: TÍNH TOÁN VẬT LÝ & VA CHẠM (PHYSICS) ---
 // Nạp thông số bản đồ mới (id = 0, 1, 2) từ bảng MAPS[] và đặt lại vị trí target_y ban đầu
-void map_load(unsigned char id);
+/* Game physics and collision detection.
+ * X points right and Y points up. Time is measured in game ticks.
+ */
+#define PHYSICS_MIN_ANGLE_DEG        15
+#define PHYSICS_MAX_ANGLE_DEG        75
+#define TARGET_MOVE_INTERVAL_TICKS   4
+#define PHYSICS_MAX_FLIGHT_TICKS     750
+#define PHYSICS_SUBSTEPS_PER_TICK    4
+#define PHYSICS_EPSILON              0.0001f
+#define COLLISION_SEPARATION_PX      0.001f
 
-// Cộng/trừ góc nâng nòng pháo theo tham số delta và giới hạn trong [15, 75] độ
-void physics_set_angle(int delta);
+#define COLLISION_NONE               0
+#define COLLISION_HIT                1
+#define COLLISION_MISS               2
+#define COLLISION_BOUNCE             3
 
-// Tính tọa độ xuất phát tại đầu nòng và vận tốc ban đầu (vx, vy) dựa theo góc & lực
-void physics_launch_ball(void);
+static int previous_target_y;
+static unsigned char target_move_ticks = 0;
+static unsigned char flight_result = COLLISION_NONE;
+static unsigned int flight_ticks = 0;
 
-// Cập nhật tọa độ (ball_x, ball_y) theo trọng lực và xử lý nảy khi chạm trần/tường
-void physics_update_ball(void);
+/* Map IDs are 1, 2 and 3. The table index starts at 0. */
+void map_load(unsigned char id)
+{
+    unsigned char i;
 
-// Cập nhật tọa độ di chuyển lên/xuống của bia mục tiêu khi người chơi chọn Map 3
-void physics_update_target(void);
+    if (id < 1 || id > 3) return;
+    i = id - 1;
 
-// Kiểm tra trạng thái quả bóng (0: đang bay, 1: rơi trúng rổ, 2: bắn trượt/chạm đất)
-unsigned char physics_check_collision(void);
+    current_map.has_wall = MAPS[i].has_wall;
+    current_map.wall_x = MAPS[i].wall_x;
+    current_map.wall_y = MAPS[i].wall_y;
+    current_map.wall_w = MAPS[i].wall_w;
+    current_map.wall_h = MAPS[i].wall_h;
+    current_map.basket_x = MAPS[i].basket_x;
+    current_map.basket_w = MAPS[i].basket_w;
+    current_map.basket_h = MAPS[i].basket_h;
+    current_map.basket_min_y = MAPS[i].basket_min_y;
+    current_map.basket_max_y = MAPS[i].basket_max_y;
+    current_map.is_moving = MAPS[i].is_moving;
 
+    map_id = id;
+    target_y = current_map.basket_min_y;
+    target_dir = 1;
+    previous_target_y = target_y;
+    target_move_ticks = 0;
+
+    flight_result = COLLISION_NONE;
+    flight_ticks = 0;
+    ball_x = CANNON_X;
+    ball_y = CANNON_Y;
+    vx = 0.0f;
+    vy = 0.0f;
+
+    lcd_dirty = 1;
+    glcd_dirty = 1;
+}
+
+void physics_set_angle(int delta)
+{
+    long next_angle;
+
+    next_angle = (long)angle + delta;
+    if (next_angle < PHYSICS_MIN_ANGLE_DEG)
+        next_angle = PHYSICS_MIN_ANGLE_DEG;
+    if (next_angle > PHYSICS_MAX_ANGLE_DEG)
+        next_angle = PHYSICS_MAX_ANGLE_DEG;
+
+    if (angle != (int)next_angle) {
+        angle = (int)next_angle;
+        lcd_dirty = 1;
+        glcd_dirty = 1;
+    }
+}
+
+void physics_launch_ball(void)
+{
+    float theta, speed, cosine, sine;
+
+    physics_set_angle(0);
+    if (power_lvl < 1 || power_lvl > 3) {
+        power_lvl = 2;
+        lcd_dirty = 1;
+    }
+
+    theta = angle * (3.14159265358979323846f / 180.0f);
+    cosine = (float)cos(theta);
+    sine = (float)sin(theta);
+    speed = V0_TABLE[power_lvl];
+
+    ball_x = CANNON_X + BARREL_LEN * cosine;
+    ball_y = CANNON_Y + BARREL_LEN * sine;
+    vx = speed * cosine;
+    vy = speed * sine;
+
+    previous_target_y = target_y;
+    flight_result = COLLISION_NONE;
+    flight_ticks = 0;
+    glcd_dirty = 1;
+}
+
+void physics_update_target(void)
+{
+    previous_target_y = target_y;
+
+    if (!current_map.is_moving) return;
+    if (++target_move_ticks < TARGET_MOVE_INTERVAL_TICKS) return;
+
+    target_move_ticks = 0;
+    target_y += target_dir;
+
+    if (target_y >= current_map.basket_max_y) {
+        target_y = current_map.basket_max_y;
+        target_dir = -1;
+    } else if (target_y <= current_map.basket_min_y) {
+        target_y = current_map.basket_min_y;
+        target_dir = 1;
+    }
+
+    glcd_dirty = 1;
+}
+
+/* Select the first contact along the current movement segment. */
+static void consider_collision(
+    float fraction, unsigned char kind,
+    signed char normal_x, signed char normal_y,
+    float *best_fraction, unsigned char *best_kind,
+    signed char *best_x, signed char *best_y)
+{
+    if (fraction < 0.0f || fraction > 1.0f) return;
+
+    if (fraction < *best_fraction - PHYSICS_EPSILON) {
+        *best_fraction = fraction;
+        *best_kind = kind;
+        *best_x = normal_x;
+        *best_y = normal_y;
+    } else if (fabs(fraction - *best_fraction) <= PHYSICS_EPSILON &&
+               kind == COLLISION_BOUNCE && *best_kind == COLLISION_BOUNCE) {
+        if (normal_x != 0) *best_x = normal_x;
+        if (normal_y != 0) *best_y = normal_y;
+    }
+}
+
+static void physics_advance_substep(float duration, float tick_fraction)
+{
+    float remaining, end_x, end_y, dx, dy, fraction, other;
+    float best, consumed, left, right, bottom, top;
+    float rim_start, rim_end, gap_start, gap_end, crossing_x;
+    unsigned char kind, contacts;
+    signed char normal_x, normal_y;
+
+    remaining = duration;
+    contacts = 0;
+
+    while (remaining > PHYSICS_EPSILON && flight_result == COLLISION_NONE) {
+        end_x = ball_x + vx * remaining;
+        end_y = ball_y + vy * remaining
+              - 0.5f * GRAVITY * remaining * remaining;
+        dx = end_x - ball_x;
+        dy = end_y - ball_y;
+
+        best = 2.0f;
+        kind = COLLISION_NONE;
+        normal_x = 0;
+        normal_y = 0;
+
+        /* The sides and ceiling bounce. Ground contact ends the shot. */
+        if (dx < -PHYSICS_EPSILON)
+            consider_collision(-ball_x / dx, COLLISION_BOUNCE, 1, 0,
+                &best, &kind, &normal_x, &normal_y);
+
+        if (dx > PHYSICS_EPSILON)
+            consider_collision((SCREEN_W - 1 - ball_x) / dx,
+                COLLISION_BOUNCE, -1, 0, &best, &kind, &normal_x, &normal_y);
+
+        if (dy > PHYSICS_EPSILON)
+            consider_collision((SCREEN_H - 1 - ball_y) / dy,
+                COLLISION_BOUNCE, 0, -1, &best, &kind, &normal_x, &normal_y);
+
+        if (dy < -PHYSICS_EPSILON)
+            consider_collision(-ball_y / dy, COLLISION_MISS, 0, 0,
+                &best, &kind, &normal_x, &normal_y);
+
+        /* Check the four faces of the wall. */
+        if (current_map.has_wall) {
+            left = current_map.wall_x;
+            right = left + current_map.wall_w;
+            bottom = current_map.wall_y;
+            top = bottom + current_map.wall_h;
+
+            if (dx > PHYSICS_EPSILON) {
+                fraction = (left - ball_x) / dx;
+                other = ball_y + dy * fraction;
+                if (other >= bottom && other <= top)
+                    consider_collision(fraction, COLLISION_BOUNCE, -1, 0,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dx < -PHYSICS_EPSILON) {
+                fraction = (right - ball_x) / dx;
+                other = ball_y + dy * fraction;
+                if (other >= bottom && other <= top)
+                    consider_collision(fraction, COLLISION_BOUNCE, 1, 0,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dy < -PHYSICS_EPSILON) {
+                fraction = (top - ball_y) / dy;
+                other = ball_x + dx * fraction;
+                if (other >= left && other <= right)
+                    consider_collision(fraction, COLLISION_BOUNCE, 0, 1,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dy > PHYSICS_EPSILON) {
+                fraction = (bottom - ball_y) / dy;
+                other = ball_x + dx * fraction;
+                if (other >= left && other <= right)
+                    consider_collision(fraction, COLLISION_BOUNCE, 0, -1,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+        }
+
+        /* Interpolate where the ball crosses the basket opening. */
+        rim_start = previous_target_y + current_map.basket_h
+                  + (target_y - previous_target_y) * tick_fraction;
+        rim_end = previous_target_y + current_map.basket_h
+                + (target_y - previous_target_y) * (tick_fraction + remaining);
+
+        gap_start = ball_y - rim_start;
+        gap_end = end_y - rim_end;
+
+        if (gap_start >= 0.0f && gap_end <= 0.0f && gap_start > gap_end) {
+            fraction = gap_start / (gap_start - gap_end);
+            crossing_x = ball_x + dx * fraction;
+
+            if (vy - GRAVITY * remaining * fraction < 0.0f &&
+                crossing_x > current_map.basket_x &&
+                crossing_x < current_map.basket_x + current_map.basket_w) {
+                consider_collision(fraction, COLLISION_HIT, 0, 0,
+                    &best, &kind, &normal_x, &normal_y);
+            }
+        }
+
+        if (kind == COLLISION_NONE) {
+            ball_x = end_x;
+            ball_y = end_y;
+            vy -= GRAVITY * remaining;
+            return;
+        }
+
+        consumed = remaining * best;
+        ball_x += dx * best;
+        ball_y += dy * best;
+        vy -= GRAVITY * consumed;
+        tick_fraction += consumed;
+        remaining -= consumed;
+
+        if (kind == COLLISION_HIT || kind == COLLISION_MISS) {
+            flight_result = kind;
+            return;
+        }
+
+        if (normal_x != 0) {
+            vx = -vx * BOUNCE_FACTOR;
+            ball_x += normal_x * COLLISION_SEPARATION_PX;
+        }
+        if (normal_y != 0) {
+            vy = -vy * BOUNCE_FACTOR;
+            ball_y += normal_y * COLLISION_SEPARATION_PX;
+        }
+
+        if (++contacts >= 4) {
+            flight_result = COLLISION_MISS;
+            return;
+        }
+    }
+}
+
+void physics_update_ball(void)
+{
+    unsigned char step;
+    float duration;
+
+    if (flight_result != COLLISION_NONE) return;
+
+    duration = 1.0f / PHYSICS_SUBSTEPS_PER_TICK;
+    for (step = 0;
+         step < PHYSICS_SUBSTEPS_PER_TICK && flight_result == COLLISION_NONE;
+         ++step) {
+        physics_advance_substep(duration, step * duration);
+    }
+
+    if (++flight_ticks >= PHYSICS_MAX_FLIGHT_TICKS &&
+        flight_result == COLLISION_NONE) {
+        flight_result = COLLISION_MISS;
+    }
+
+    glcd_dirty = 1;
+}
+
+/* 0 = still flying, 1 = hit, 2 = miss. */
+unsigned char physics_check_collision(void)
+{
+    return flight_result;
+}
 
 // --- NHÓM 4: HIỂN THỊ ĐỒ HỌA CHIẾN TRƯỜNG TRÊN GLCD (84x48) ---
 // Cấu hình thông số vật lý (font, contrast, bias) và xóa trắng màn hình GLCD
@@ -156,6 +715,159 @@ void glcd_ui_init(void);
 
 // Xóa khung cũ và vẽ lại toàn bộ bệ pháo, nòng pháo, tường chắn, rổ và bóng lên GLCD
 void glcd_render_frame(void);
+
+// Chuyển đổi tọa độ Y vật lý (đáy-đỉnh => đỉnh-đáy)
+static int phys_to_glcd_y(int py) {
+    int gy = (SCREEN_H - 1) - py;
+    if (gy < 0) gy = 0;
+    if (gy >= SCREEN_H) gy = SCREEN_H - 1;
+    return gy;
+}
+
+// Giới hạn tọa độ X trong vùng hiển thị hợp lệ [0 .. SCREEN_W - 1]
+static int clamp_glcd_x(int gx) {
+    if (gx < 0) return 0;
+    if (gx >= SCREEN_W) return SCREEN_W - 1;
+    return gx;
+}
+
+// 1. Cấu hình thông số vật lý (font, contrast, bias) và xóa trắng màn hình GLCD
+void glcd_ui_init(void) {
+    GLCDINIT_t glcd_init_data;
+
+    // Bật đèn nền màn hình LCD/GLCD
+    LCD_BL = 1;
+
+    // Cấu hình bộ điều khiển PCD8544 (Nokia 5110) trong CodeVisionAVR
+    glcd_init_data.font      = font5x7;
+    glcd_init_data.readxmem  = NULL;
+    glcd_init_data.writexmem = NULL;
+    glcd_init_data.temp_coef = PCD8544_DEFAULT_TEMP_COEF; // Hệ số bù nhiệt (mặc định = 2)
+    glcd_init_data.bias      = PCD8544_DEFAULT_BIAS;      // Điện áp phân cực (mặc định = 4)
+    glcd_init_data.vlcd      = PCD8544_DEFAULT_VLCD;      // Độ tương phản (mặc định ~ 60-66)
+
+    glcd_init(&glcd_init_data);
+    glcd_clear();
+    glcd_dirty = 1;
+}
+
+// Hàm phụ trợ: Vẽ bệ pháo, nòng pháo xoay theo góc bắn và 2 điểm dẫn hướng
+static void glcd_draw_cannon(void) {
+    float rad;
+    int base_gx, base_gy;
+    int tip_gx, tip_gy;
+    int dot_x, dot_y;
+
+    rad     = (float)angle * DEG_TO_RAD;
+    base_gx = CANNON_X;
+    base_gy = phys_to_glcd_y(CANNON_Y);
+
+    // Tính tọa độ đầu nòng pháo (làm tròn +0.5f để giảm sai số số nguyên)
+    tip_gx = clamp_glcd_x((int)(CANNON_X + BARREL_LEN * cos(rad) + 0.5f));
+    tip_gy = phys_to_glcd_y((int)(CANNON_Y + BARREL_LEN * sin(rad) + 0.5f));
+
+    // Vẽ bệ pháo (thân tròn xoay + chân đế đặt sát mặt đất)
+    glcd_fillcircle(base_gx, base_gy, 4);
+    glcd_bar(1, base_gy + 1, 11, SCREEN_H - 1);
+
+    // Vẽ nòng pháo dày 2 pixel để hiển thị rõ nét trên màn hình đơn sắc
+    glcd_line(base_gx, base_gy, tip_gx, tip_gy);
+    if (base_gy > 0 && tip_gy > 0) {
+        glcd_line(base_gx, base_gy - 1, tip_gx, tip_gy - 1);
+    }
+
+    // Khi đang ở trạng thái ngắm bắn (ST_AIM), vẽ thêm 2 điểm dẫn hướng đầu nòng
+    if (game_state == ST_AIM) {
+        dot_x = (int)(CANNON_X + (BARREL_LEN + 4) * cos(rad) + 0.5f);
+        dot_y = (SCREEN_H - 1) - (int)(CANNON_Y + (BARREL_LEN + 4) * sin(rad) + 0.5f);
+        if (dot_x >= 0 && dot_x < SCREEN_W && dot_y >= 0 && dot_y < SCREEN_H) {
+            glcd_setpixel(dot_x, dot_y);
+        }
+
+        dot_x = (int)(CANNON_X + (BARREL_LEN + 8) * cos(rad) + 0.5f);
+        dot_y = (SCREEN_H - 1) - (int)(CANNON_Y + (BARREL_LEN + 8) * sin(rad) + 0.5f);
+        if (dot_x >= 0 && dot_x < SCREEN_W && dot_y >= 0 && dot_y < SCREEN_H) {
+            glcd_setpixel(dot_x, dot_y);
+        }
+    }
+}
+
+// Hàm phụ trợ: Vẽ tường chắn chướng ngại vật (Map 2)
+static void glcd_draw_wall(unsigned char idx) {
+    int wx0, wx1, wy0, wy1;
+
+    if (!MAPS[idx].has_wall) return;
+
+    wx0 = clamp_glcd_x(MAPS[idx].wall_x);
+    wx1 = clamp_glcd_x(MAPS[idx].wall_x + MAPS[idx].wall_w - 1);
+    wy1 = phys_to_glcd_y(MAPS[idx].wall_y);
+    wy0 = phys_to_glcd_y(MAPS[idx].wall_y + MAPS[idx].wall_h - 1);
+
+    glcd_bar(wx0, wy0, wx1, wy1);
+}
+
+// Hàm phụ trợ: Vẽ bia mục tiêu dạng hình tròn đồng tâm
+static void glcd_draw_target(unsigned char idx) {
+    int cx, cy, r;
+
+    r = MAPS[idx].basket_w / 2;
+    if (r < 2) r = 2;
+
+    cx = clamp_glcd_x(MAPS[idx].basket_x + r);
+    cy = phys_to_glcd_y(target_y + (MAPS[idx].basket_h / 2));
+
+    if (cx < r) cx = r;
+    if (cx >= SCREEN_W - r) cx = SCREEN_W - 1 - r;
+    if (cy < r) cy = r;
+    if (cy >= SCREEN_H - r) cy = SCREEN_H - 1 - r;
+
+    glcd_circle(cx, cy, r);
+    if (r >= 4) {
+        glcd_circle(cx, cy, r / 2);
+    }
+    glcd_setpixel(cx, cy);
+}
+
+// Hàm phụ trợ: Vẽ quả bóng bàn khi đang bay (ST_FLY) hoặc vừa chạm đích (ST_RESULT)
+static void glcd_draw_ball(void) {
+    int gx, gy;
+
+    if (game_state != ST_FLY && game_state != ST_RESULT) return;
+
+    gx = (int)(ball_x + 0.5f);
+    gy = (SCREEN_H - 1) - (int)(ball_y + 0.5f);
+
+    if (gx >= 0 && gx < SCREEN_W && gy >= 0 && gy < SCREEN_H) {
+        if (gx < BALL_RADIUS) gx = BALL_RADIUS;
+        if (gx >= SCREEN_W - BALL_RADIUS) gx = SCREEN_W - 1 - BALL_RADIUS;
+        if (gy < BALL_RADIUS) gy = BALL_RADIUS;
+        if (gy >= SCREEN_H - BALL_RADIUS) gy = SCREEN_H - 1 - BALL_RADIUS;
+
+        glcd_fillcircle(gx, gy, BALL_RADIUS);
+    }
+}
+
+// Xóa khung cũ và vẽ lại toàn bộ bệ pháo, nòng pháo, tường chắn, rổ và bóng lên GLCD
+void glcd_render_frame(void) {
+    // Đã kiểm tra cờ glcd_dirty tương tự như lcd_dirty trong lcd_update_status
+    if (glcd_dirty) {
+        unsigned char idx;
+
+        // Quy đổi map_id (1..3) sang chỉ số mảng (0..2)
+        idx = (map_id >= 1 && map_id <= 3) ? (map_id - 1) : 0;
+
+        glcd_clear();
+
+        glcd_line(0, SCREEN_H - 1, SCREEN_W - 1, SCREEN_H - 1);
+
+        glcd_draw_wall(idx);
+        glcd_draw_target(idx);
+        glcd_draw_cannon();
+        glcd_draw_ball();
+
+        glcd_dirty = 0; // Đặt lại cờ sau khi đã vẽ xong
+    }
+}
 
 
 // --- NHÓM 5: HIỂN THỊ PHỤ & TÍN HIỆU BÁO HIỆU (LCD, LED 7 ĐOẠN, RELAY, RGB) ---
@@ -297,27 +1009,98 @@ void rgb_set_state(unsigned char state) {
 
 // 6. HÀM MAIN (VÒNG LẶP CHÍNH)
 // Cần check logic lại nhé. logic bên dưới chỉ là gợi ý.
-void main(void) {
-    // Gọi các hàm init thiết lập trạng thái ban đầu
-    
+void main(void)
+{
+    unsigned char saved_sreg, have_tick;
+    unsigned char result, reset_requested;
+
+    system_init();
+    game_reset();
+    led7_set(score, shots);
+
     while (1) {
-        // --- NHỊP HỆ THỐNG (Mỗi vòng lặp ~8-10ms nhờ quét LED 7 đoạn) ---
-        // 1. Quét LED 7 đoạn & cập nhật bộ đếm tắt Relay (nếu relay_timer > 0) (Chạy trong code ISR)
-        // 2. Gọi input_update() và handle_keypad()
-        
-        // --- MÁY TRẠNG THÁI ---
-        // Case ST_AIM:
-        //   - Cập nhật bia di động (physics_update_target)
-        //   - Nếu Manual: xử lý btn_event (BT2 tăng góc, BT3 giảm góc, BT1 gọi trigger_fire)
-        //   - Nếu Auto: gọi auto_step()
-        
-        // Case ST_FLY:
-        //   - Cập nhật vật lý bóng & bia, vẽ lại GLCD
-        //   - Gọi physics_check_collision():
-        //     + Nếu Trúng (1): score++, last_result = 1, rgb_set_state(1), state_timer = 50 (~1s), chuyển sang ST_RESULT
-        //     + Nếu Trượt (2): last_result = 2, rgb_set_state(2), state_timer = 100 (~2s), chuyển sang ST_RESULT
-        
-        // Case ST_RESULT:
-        //   - Giảm state_timer mỗi tick; khi state_timer == 0 thì bật lại LED xanh dương (rgb_set_state(0)) và quay về ST_AIM
+        /* Wait for the next game tick from Timer0. */
+        saved_sreg = SREG;
+        #asm("cli")
+        have_tick = tick_flag;
+        tick_flag = 0;
+        SREG = saved_sreg;
+
+        if (!have_tick) continue;
+
+        if (state_timer != 0) --state_timer;
+
+        if (relay_timer != 0) {
+            --relay_timer;
+            if (relay_timer == 0) RELAY1 = 0;
+        }
+
+        /* Read the controls. Reset is available in every state. */
+        input_update();
+        reset_requested = (key_event == 9);
+        if (reset_requested) btn_event = 0;
+        if (game_state == ST_AIM || reset_requested) handle_keypad();
+        key_event = 0;
+
+        /* Skip the state update on a reset tick. */
+        if (!reset_requested) {
+            switch (game_state) {
+            case ST_AIM:
+                physics_update_target();
+
+                if (auto_mode) {
+                    auto_step();
+                } else {
+                    switch (btn_event) {
+                    case 1: trigger_fire(); break;
+                    case 2: physics_set_angle(1); break;
+                    case 3: physics_set_angle(-1); break;
+                    }
+                }
+
+                if (game_state == ST_FLY) {
+                    lcd_dirty = 1;
+                    glcd_dirty = 1;
+                }
+                break;
+
+            case ST_FLY:
+                physics_update_target();
+                physics_update_ball();
+                result = physics_check_collision();
+
+                if (result != COLLISION_NONE) {
+                    if (result == COLLISION_HIT && score < 99) ++score;
+
+                    last_result = result;
+                    rgb_set_state(result);
+                    state_timer = (result == COLLISION_HIT) ? 50 : 100;
+                    game_state = ST_RESULT;
+                    lcd_dirty = 1;
+                    glcd_dirty = 1;
+                }
+                break;
+
+            case ST_RESULT:
+                if (state_timer == 0) {
+                    game_state = ST_AIM;
+                    last_result = 0;
+                    rgb_set_state(0);
+                    lcd_dirty = 1;
+                    glcd_dirty = 1;
+                }
+                break;
+
+            default:
+                game_reset();
+                break;
+            }
+        }
+
+        /* Refresh displays after handling the game state. */
+        btn_event = 0;
+        led7_set(score, shots);
+
+        lcd_update_status();
     }
 }
