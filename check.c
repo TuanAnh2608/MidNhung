@@ -82,7 +82,7 @@ typedef struct {
 
 flash MapConfig MAPS[3] = {
     {0,  0, 0, 0,  0, 70, 11, 6, 10, 10, 0}, // Map 1: Khung chu nhat huong len co dinh
-    {1, 41, 0, 3, 24, 70, 11, 6, 10, 10, 0}, // Map 2: Tuong chan + khung chu nhat huong len
+    {1, 41, 0, 3, 24, 70, 11, 6, 10, 10, 0}, // Map 2: Tuong chan (rong 3px) + khung chu nhat
     {0,  0, 0, 0,  0, 70, 11, 4,  6, 36, 1}  // Map 3: Vong tron rong ruot di chuyen
 };
 
@@ -508,6 +508,7 @@ static void consider_collision(
 static void physics_advance_substep(float duration, float tick_fraction) {
     float remaining, end_x, end_y, dx, dy, fraction, other;
     float best, consumed, left, right, bottom, top;
+    float bx_left, bx_right, by_bot, by_top;
     float box_left, box_right, box_bottom, box_top;
     float target_cx, target_cy, hit_r, dist_x, dist_y;
     unsigned char kind, contacts;
@@ -583,11 +584,52 @@ static void physics_advance_substep(float duration, float tick_fraction) {
         }
 
         if (!current_map.is_moving) {
-            // Map 1 & Map 2: Bong phai lot han vao ben trong long khung chu nhat
-            box_left   = (float)current_map.basket_x + 2.0f;
-            box_right  = (float)((long)current_map.basket_x + current_map.basket_w - 1) - 2.0f;
-            box_bottom = (float)target_y + 1.5f;
-            box_top    = (float)((long)target_y + current_map.basket_h) - 1.5f;
+            // Map 1 & Map 2: Khung chu nhat ho mieng tren (hinh chu U)
+            bx_left  = (float)current_map.basket_x;
+            bx_right = (float)((long)current_map.basket_x + current_map.basket_w - 1);
+            by_bot   = (float)target_y;
+            by_top   = (float)((long)target_y + current_map.basket_h);
+
+            // 1. Va cham nay ra voi thanh ngoai va mep tren cua khung chu U
+            if (dx > PHYSICS_EPSILON) {
+                fraction = ((bx_left - 1.0f) - ball_x) / dx;
+                other = ball_y + dy * fraction;
+                if (other >= by_bot - 1.0f && other <= by_top + 0.5f)
+                    consider_collision(fraction, COLLISION_BOUNCE, -1, 0,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dx < -PHYSICS_EPSILON) {
+                fraction = ((bx_right + 1.0f) - ball_x) / dx;
+                other = ball_y + dy * fraction;
+                if (other >= by_bot - 1.0f && other <= by_top + 0.5f)
+                    consider_collision(fraction, COLLISION_BOUNCE, 1, 0,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dy > PHYSICS_EPSILON) {
+                fraction = ((by_bot - 1.0f) - ball_y) / dy;
+                other = ball_x + dx * fraction;
+                if (other >= bx_left - 1.0f && other <= bx_right + 1.0f)
+                    consider_collision(fraction, COLLISION_BOUNCE, 0, -1,
+                        &best, &kind, &normal_x, &normal_y);
+            }
+
+            if (dy < -PHYSICS_EPSILON) {
+                fraction = ((by_top + 1.0f) - ball_y) / dy;
+                other = ball_x + dx * fraction;
+                if ((other >= bx_left - 1.0f && other <= bx_left + 1.0f) ||
+                    (other >= bx_right - 1.0f && other <= bx_right + 1.0f)) {
+                    consider_collision(fraction, COLLISION_BOUNCE, 0, 1,
+                        &best, &kind, &normal_x, &normal_y);
+                }
+            }
+
+            // 2. Chi tinh TRUNG khi dan lot qua mieng vao cham mep trong khung
+            box_left   = bx_left + 1.5f;
+            box_right  = bx_right - 1.6f;
+            box_bottom = by_bot + 1.0f;
+            box_top    = by_top - 1.0f;
 
             if (end_x >= box_left && end_x <= box_right &&
                 end_y >= box_bottom && end_y <= box_top) {
@@ -597,9 +639,9 @@ static void physics_advance_substep(float duration, float tick_fraction) {
                 return;
             }
         } else {
-            // Map 3: Bong phai nam ben trong long vong tron rong ruot (khong tinh cham vien ngoai)
-            target_cx = current_map.basket_x + (current_map.basket_w * 0.5f);
-            target_cy = (long)previous_target_y + (current_map.basket_h * 0.5f)
+            // Map 3: Chi tinh TRUNG khi dan nam gon ben trong long vong tron
+            target_cx = (float)((long)current_map.basket_x + (current_map.basket_w / 2));
+            target_cy = (long)previous_target_y + (current_map.basket_h / 2)
                       + ((long)target_y - previous_target_y) * (tick_fraction + remaining);
             hit_r  = (float)(current_map.basket_w / 2) - 1.5f;
             dist_x = end_x - target_cx;
@@ -676,8 +718,7 @@ unsigned char physics_check_collision(void) {
 // ============================================================================
 // NHOM 4: DRIVER & DO HOA NOKIA 5110 TREN PORTG (84x48)
 // ============================================================================
-#define DEG_TO_RAD  0.01745329f
-#define BALL_RADIUS 2
+#define DEG_TO_RAD 0.01745329f
 
 static unsigned char nokia_fb[504];
 
@@ -885,25 +926,28 @@ static void glcd_draw_target(unsigned char idx) {
 }
 
 static void glcd_draw_ball(void) {
-    int gx, gy, tx, ty;
+    int gx, gy;
+    int size, half, x0, y0;
 
     if (game_state != ST_FLY && game_state != ST_RESULT) return;
 
-    if (game_state == ST_FLY) {
-        tx = (int)(ball_x - vx * 1.2f + 0.5f);
-        ty = (SCREEN_H - 1) - (int)(ball_y - vy * 1.2f + 0.5f);
-        fb_setpixel(tx, ty);
-    }
+    // Hinh vuong co canh bang chieu rong vat can Map 2 (MAPS[1].wall_w = 3 pixel)
+    size = MAPS[1].wall_w;
+    if (size < 1) size = 1;
+    half = size / 2;
 
     gx = (int)(ball_x + 0.5f);
     gy = (SCREEN_H - 1) - (int)(ball_y + 0.5f);
 
     if (gx >= 0 && gx < SCREEN_W && gy >= 0 && gy < SCREEN_H) {
-        if (gx < BALL_RADIUS) gx = BALL_RADIUS;
-        if (gx >= SCREEN_W - BALL_RADIUS) gx = SCREEN_W - 1 - BALL_RADIUS;
-        if (gy < BALL_RADIUS) gy = BALL_RADIUS;
-        if (gy >= SCREEN_H - BALL_RADIUS) gy = SCREEN_H - 1 - BALL_RADIUS;
-        fb_fillcircle(gx, gy, BALL_RADIUS);
+        x0 = gx - half;
+        y0 = gy - half;
+        if (x0 < 0) x0 = 0;
+        if (x0 > SCREEN_W - size) x0 = SCREEN_W - size;
+        if (y0 < 0) y0 = 0;
+        if (y0 > SCREEN_H - size) y0 = SCREEN_H - size;
+
+        fb_bar(x0, y0, x0 + size - 1, y0 + size - 1);
     }
 }
 
@@ -1111,7 +1155,7 @@ void main(void) {
 
                         last_result = result;
                         rgb_set_state(result);
-                        state_timer = (result == COLLISION_HIT) ? 50 : 100;
+                        state_timer = 50;
                         game_state = ST_RESULT;
                         lcd_dirty = 1;
                         glcd_dirty = 1;
